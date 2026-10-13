@@ -192,9 +192,10 @@ int main(void)
 	//Enable TIM0
 	TCNT1 = 0;
 	OCR1A = PWM_CNT_TOP;
-	OCR1B = PWM_CNT_TOP;	//Set timer top
-	TCCR1A = 0;
-	TCCR1B = (1<<CS10);
+	OCR1B = PWM_CNT_TOP;
+	ICR1 = PWM_CNT_TOP;	//Set timer top
+	TCCR1A = (1<<OCIE1A) | (1<<WGM11);
+	TCCR1B = (1<<CS10) | (1<<WGM12) | (1<<WGM13);
 	TIMSK = (1<<OCIE1A) | (1<<OCIE1B); //| (1<<TOIE1); ; no overflow in CTC mode
 	//Enable ADC
 	ADCSRA |= (1<<ADEN) | (1<<ADPS2) | (1<<ADPS1); //Prescaler 64
@@ -340,7 +341,7 @@ void set_brake_pw(uint16_t pulse_width)
 		for(uint16_t i=0;i<4;i++)
 		{
 			uint16_t tmp_on_ticks = 1 + val_add; //0 is not OK
-			uint16_t tmp_off_ticks = 100 + val_add;	 //2500 = perfect, 3500 also, 4999 also, 5000 always High
+			uint16_t tmp_off_ticks = 3000 + val_add;	 //2500 = perfect, 3500 also, 4999 also, 5000 always High
 			val_add += 2500;
 			//Wraparound for counter top
 			if(tmp_on_ticks >= PWM_CNT_TOP)
@@ -360,7 +361,7 @@ void set_brake_pw(uint16_t pulse_width)
 	sprintf(outstr, "1L%i,1H%i,2L%i,2H%i,3L%i,3H%i,4L%i,4H%i,1A%i,TC%i,N%i\r\n", pwm_channels[0].on_ticks,pwm_channels[0].off_ticks,pwm_channels[1].on_ticks,pwm_channels[1].off_ticks,pwm_channels[2].on_ticks,pwm_channels[2].off_ticks,pwm_channels[3].on_ticks,pwm_channels[3].off_ticks,OCR1A,TCNT1,print_val);
 }
 
-void set_next_compare(uint16_t current_compare)
+void set_next_compare_old(uint16_t current_compare)
 {
 	//FIXME - this seems to set invalid compares and ISR doesn't trigger anymore
 	//BUG: on_ticks > off_ticks gives only minimal pulse
@@ -418,7 +419,7 @@ void set_next_compare(uint16_t current_compare)
 	}
 	if(next_off_idx >=0)
 	{
-		OCR1A = pwm_channels[next_off_idx].off_ticks;
+		OCR1B = pwm_channels[next_off_idx].off_ticks;
 	}
 	//led_show_percentage(7999);
 }
@@ -459,7 +460,6 @@ void set_next_compare_dbg(uint16_t current_compare)
 		{
 			compare_dist = current_dist;
 			next_on_idx = i;
-			next_off_idx = -1;
 		}
 		//Check Off ticks
 		current_dist = (int32_t)pwm_channels[i].off_ticks - (int32_t)current_compare;
@@ -471,14 +471,13 @@ void set_next_compare_dbg(uint16_t current_compare)
 		{
 			compare_dist = current_dist;
 			next_off_idx = i;
-			next_on_idx = -1;
 		}
 	}
 	if(next_off_idx >=0)
 	{
-		OCR1A = pwm_channels[next_off_idx].off_ticks;
+		OCR1B = pwm_channels[next_off_idx].off_ticks;
 	}
-	else if(next_on_idx >=0)
+	if(next_on_idx >=0)
 	{
 		OCR1A = pwm_channels[next_on_idx].on_ticks;
 	}
@@ -530,9 +529,9 @@ bool get_onoff_state(uint16_t on_ticks, uint16_t off_ticks, uint16_t new_ticks, 
 
 ISR (TIMER1_COMPA_vect)
 {
+	sei();
 	static uint16_t last_timer_cnt = 0;
 	uint16_t timer_cnt = TCNT1; //For consistency during ISR
-	sei();
 	//led_show_percentage(TCNT1);
 	/*
 	led_show_percentage(ovf_cnt);
@@ -575,33 +574,17 @@ ISR (TIMER1_COMPA_vect)
 	{
 		PWM1_PORT |= (1<<PWM1_IO);
 	}
-	else
-	{
-		PWM1_PORT &= ~(1<<PWM1_IO);
-	}
 	if(get_onoff_state(pwm_channels[1].on_ticks, pwm_channels[1].off_ticks, timer_cnt, last_timer_cnt))
 	{
 		PWM2_PORT |= (1<<PWM2_IO);
-	}
-	else
-	{
-		PWM2_PORT &= ~(1<<PWM2_IO);
 	}
 	if(get_onoff_state(pwm_channels[2].on_ticks, pwm_channels[2].off_ticks, timer_cnt, last_timer_cnt))
 	{
 		PWM3_PORT |= (1<<PWM3_IO);
 	}
-	else
-	{
-		PWM3_PORT &= ~(1<<PWM3_IO);
-	}
 	if(get_onoff_state(pwm_channels[3].on_ticks, pwm_channels[3].off_ticks, timer_cnt, last_timer_cnt))
 	{
 		PWM4_PORT |= (1<<PWM4_IO);
-	}
-	else
-	{
-		PWM4_PORT &= ~(1<<PWM4_IO);
 	}
 	/*
 	if(timer_cnt == pwm_channels[0].on_ticks)
@@ -644,6 +627,23 @@ ISR (TIMER1_COMPA_vect)
 
 ISR (TIMER1_COMPB_vect)
 {
-	//Use COMPB for turn off?
-	TCNT1 = 0;
+	static uint16_t last_timer_cnt = 0;
+	uint16_t timer_cnt = TCNT1; //For consistency during ISR
+	if(!get_onoff_state(pwm_channels[0].on_ticks, pwm_channels[0].off_ticks, timer_cnt, last_timer_cnt))
+	{
+		PWM1_PORT &= ~(1<<PWM1_IO);
+	}
+	if(!get_onoff_state(pwm_channels[1].on_ticks, pwm_channels[1].off_ticks, timer_cnt, last_timer_cnt))
+	{
+		PWM2_PORT &= ~(1<<PWM2_IO);
+	}
+	if(!get_onoff_state(pwm_channels[2].on_ticks, pwm_channels[2].off_ticks, timer_cnt, last_timer_cnt))
+	{
+		PWM3_PORT &= ~(1<<PWM3_IO);
+	}
+	if(!get_onoff_state(pwm_channels[3].on_ticks, pwm_channels[3].off_ticks, timer_cnt, last_timer_cnt))
+	{
+		PWM4_PORT &= ~(1<<PWM4_IO);
+	}
+	last_timer_cnt = timer_cnt;
 }
