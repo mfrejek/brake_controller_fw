@@ -60,11 +60,18 @@
 #define LED_4_MIN_PW (uint16_t)((PWM_CNT_TOP / 5) * 3)
 #define LED_5_MIN_PW (uint16_t)((PWM_CNT_TOP / 5) * 4)
 #define LED_6_MIN_PW (uint16_t)((PWM_CNT_TOP / 10) * 9)
+#define VSENSE_DIV_RATIO			45		//Voltage divider ratio; 660k over 15k
+#define VBUS_2MV_PER_TICK		(1.28f * VSENSE_DIV_RATIO) / 1024.0f
 
 #define BRAKE_VOLTAGE_START_2MV	(20000 / 2)	//Start braking at this DC voltage
 #define BRAKE_VOLTAGE_END_2MV	(30000 / 2)	//Start braking at this DC voltage
-#define VSENSE_DIV_RATIO			45		//Voltage divider ratio; 660k over 15k
-#define VBUS_MV_PER TICK			(2.56f * VSENSE_DIV_RATIO) / 1024.0f;
+#define BRAKE_VOLTAGE_START_ADC	(uint16_t) (BRAKE_VOLTAGE_START_2MV / VBUS_2MV_PER_TICK)	//Start braking at this ADC reading
+#define BRAKE_VOLTAGE_END_ADC	(uint16_t) (BRAKE_VOLTAGE_END_2MV / VBUS_2MV_PER_TICK)	//Max braking at this ADC reading
+#define BRAKE_VOLTAGE_GRADIENT (BRAKE_VOLTAGE_END_ADC - BRAKE_VOLTAGE_START_ADC) / PWM_CNT_TOP // PWM ticks per ADC
+
+
+#define ADC_CONV_AVG_SAMPLES			16 //Average over 16 samples per channel
+#define ADC_CONV_AVG_SHIFT			 4
 
 #define BAUD 125000UL      // Baudrate
 
@@ -83,6 +90,18 @@ volatile uint32_t print_val = 42;
 unsigned char outstr[80];
 volatile uint16_t dbg_var[10];
 volatile uint16_t last_timer_cnt = 0;
+volatile bool adc_isr_running = false;
+
+uint16_t vmot_2mv = 0;
+uint16_t vpsu_2mv = 0;
+
+
+#define NUM_ADC_CHAN 2
+#define MAX_ADC_CHAN_IDX (NUM_ADC_CHAN - 1)
+volatile uint16_t adc_conv_sum[NUM_ADC_CHAN];
+volatile uint8_t adc_conv_cnt[NUM_ADC_CHAN];
+volatile uint8_t curr_adc_conv = 0;
+volatile uint16_t adc_res[NUM_ADC_CHAN];
 
 
 typedef enum {
@@ -103,8 +122,6 @@ typedef struct
 } PwmChannel_t;
 volatile PwmChannel_t pwm_channels[4];
 
-
-volatile uint16_t adc_res = 0;
 volatile uint16_t next_compare = 0;
 volatile uint16_t new_pulse_width = 0;
 
@@ -174,6 +191,19 @@ void adc_schedule_next_measurement(void)
 		chan_cnt = 1; //chan_cnt goes from 1...8
 	}
 }
+uint16_t calc_brake_pw(uint16_t vmot_2mv)
+{
+	//For now, let PW just increase linearly
+	if(vmot_2mv <= BRAKE_VOLTAGE_START_2MV)
+	{
+		return 0;
+	}
+	else if(vmot_2mv >= BRAKE_VOLTAGE_END_2MV)
+	{
+		return PWM_CNT_TOP;
+	}
+	return (vmot_2mv - BRAKE_VOLTAGE_START_2MV) * BRAKE_VOLTAGE_GRADIENT;
+}
 
 int main(void)
 {
@@ -203,7 +233,7 @@ int main(void)
 	TIMSK = (1<<OCIE1A) | (1<<OCIE1B); //| (1<<TOIE1); ; no overflow in CTC mode
 	//Enable ADC
 	ADCSRA |= (1<<ADEN) | (1<<ADPS2) | (1<<ADPS1); //Prescaler 64
-	adc_res = ADCW;
+	adc_res[curr_adc_conv] = ADCW;
 	//Enable UART
 	uart_init();
 	sei();
@@ -214,6 +244,31 @@ int main(void)
 	uint32_t loop_cnt = 0;
     while (1) 
     {
+		//Check ADC measurements
+		if(adc_conv_cnt[curr_adc_conv] == ADC_CONV_AVG_SAMPLES)
+		{
+			uint16_t adc_val = adc_conv_sum[curr_adc_conv] >> ADC_CONV_AVG_SHIFT;
+			adc_conv_sum[curr_adc_conv] = 0; //Reset for next measurement
+			switch(curr_adc_conv) {
+				case 0:
+					vmot_2mv = (float)adc_val * VBUS_2MV_PER_TICK;
+					break;
+				case 1:
+					vpsu_2mv = (float)adc_val * VBUS_2MV_PER_TICK;
+					break;
+				default:
+					break;
+			}
+			if(curr_adc_conv < MAX_ADC_CHAN_IDX)
+			{
+				curr_adc_conv++;
+			}
+			else
+			{
+				curr_adc_conv = 0;
+			}
+		}
+		brake_pw = calc_brake_pw(vmot_2mv);
 		//new_pulse_width = brake_pw;
 		set_brake_pw(brake_pw);
 		TCCR1B |= (1<<CS11); //This starts the timer
@@ -821,4 +876,23 @@ ISR (TIMER1_COMPB_vect)
 	}
 	set_next_compare_off(timer_cnt);
 	last_timer_cnt = timer_cnt;
+}
+
+/*
+volatile uint16_t adc_conv_sum[2];
+volatile uint8_t adc_conv_cnt[2];
+volatile uint8_t curr_adc_conv = 0;
+volatile uint16_t adc_res[2];
+*/
+ISR (ADC_vect)
+{
+	adc_isr_running = true;
+	uint16_t tmpval = ADCW; //Needed for next conv to start
+	if(adc_conv_cnt[curr_adc_conv] < ADC_CONV_AVG_SAMPLES)
+	{
+		adc_conv_sum[curr_adc_conv] += tmpval;
+		adc_conv_cnt[curr_adc_conv]++;
+	}
+	
+	adc_isr_running = false;
 }
